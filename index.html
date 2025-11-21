@@ -1,0 +1,465 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Tetris Online — single file</title>
+  <style>
+:root{
+  --bg:#0b1220;
+  --panel:#111827;
+  --accent:#00d4ff;
+  --text:#e6eef6;
+}
+*{box-sizing:border-box}
+body{
+  margin:0;
+  font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;
+  background:linear-gradient(180deg,#08101a, #07121b 60%);
+  color:var(--text);
+  display:flex;
+  min-height:100vh;
+  align-items:center;
+  justify-content:center;
+}
+#app{width:100%;max-width:900px;padding:16px}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+h1{margin:0;font-size:20px}
+#controls button{margin-left:8px;padding:8px 10px;background:var(--panel);color:var(--text);border:1px solid rgba(255,255,255,0.04);border-radius:6px}
+#game-area{display:flex;gap:12px;align-items:flex-start}
+canvas{background:#081018;border-radius:6px;border:2px solid rgba(255,255,255,0.02);image-rendering:pixelated}
+#side{color:var(--text);display:flex;flex-direction:column;gap:8px;width:220px}
+#score{font-size:18px}
+#next{min-height:60px}
+.hidden{display:none}
+.touch{display:none}
+.touch button{font-size:20px;padding:12px;margin:6px;border-radius:8px;background:var(--panel);color:var(--text);border:none}
+.modal{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center}
+.modal-content{background:var(--panel);padding:16px;border-radius:8px;width:300px}
+@media (max-width:640px){
+  #app{padding:8px}
+  #game-area{flex-direction:column;align-items:center}
+  #side{width:100%}
+  canvas{width:240px;height:480px}
+  .touch{display:flex;justify-content:center;flex-wrap:wrap}
+  #controls button{padding:6px 8px}
+}
+.room-warning{font-size:12px;color:#fbb;}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <header>
+      <h1>Tetris Online</h1>
+      <div id="controls">
+        <button id="btn-single">Single Player</button>
+        <button id="btn-online">Online Play</button>
+        <button id="btn-leaderboard">Leaderboard</button>
+      </div>
+    </header>
+
+    <main>
+      <div id="game-area">
+        <canvas id="board" width="200" height="400"></canvas>
+        <div id="side">
+          <div id="score">Score: 0</div>
+          <div id="next">Next:</div>
+          <div id="opponent">Opponent: —</div>
+          <div id="roomUI" class="hidden">
+            <input id="roomName" placeholder="room name" />
+            <input id="playerName" placeholder="your name" />
+            <button id="joinRoom">Join</button>
+            <button id="leaveRoom">Leave</button>
+            <div id="roomWarning" class="room-warning hidden"></div>
+          </div>
+          <div id="touchControls" class="touch">
+            <button id="leftBtn">◀</button>
+            <button id="rotateBtn">⟳</button>
+            <button id="rightBtn">▶</button>
+            <button id="dropBtn">▼</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="leaderboardModal" class="modal hidden">
+        <div class="modal-content">
+          <h3>Leaderboard (Top)</h3>
+          <ol id="leaderboardList"></ol>
+          <button id="closeLeaderboard">Close</button>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <small>Works on mobile and desktop. Use arrow keys or touch buttons. Online play requires a compatible socket.io server.</small>
+    </footer>
+  </div>
+
+  <!-- Socket.IO client (CDN) - client library only; server still required for online features -->
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+
+  <script>
+/*
+ Single-file Tetris client
+ - Inline CSS + UI + game logic
+ - Attempts to use socket.io client library (loaded above). A socket.io server is still required for online features.
+*/
+
+let socket = null;
+function connectSocket(serverUrl) {
+  // serverUrl optional. If omitted, tries same origin.
+  if (typeof io === 'undefined') return null;
+  try {
+    socket = serverUrl ? io(serverUrl) : io();
+    return socket;
+  } catch (e) {
+    console.warn('socket.io connection failed', e);
+    socket = null;
+    return null;
+  }
+}
+
+// Canvas and game setup
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const scale = 20;
+const COLS = 10;
+const ROWS = 20;
+
+canvas.width = COLS * scale;
+canvas.height = ROWS * scale;
+
+const scoreEl = document.getElementById('score');
+const opponentEl = document.getElementById('opponent');
+const btnSingle = document.getElementById('btn-single');
+const btnOnline = document.getElementById('btn-online');
+const btnLeaderboard = document.getElementById('btn-leaderboard');
+const roomUI = document.getElementById('roomUI');
+const roomNameInput = document.getElementById('roomName');
+const playerNameInput = document.getElementById('playerName');
+const joinRoomBtn = document.getElementById('joinRoom');
+const leaveRoomBtn = document.getElementById('leaveRoom');
+const leaderboardModal = document.getElementById('leaderboardModal');
+const leaderboardList = document.getElementById('leaderboardList');
+const closeLeaderboard = document.getElementById('closeLeaderboard');
+const roomWarning = document.getElementById('roomWarning');
+
+let arena = createMatrix(COLS, ROWS);
+let player = {
+  pos: {x:0,y:0},
+  matrix: null,
+  score: 0,
+  next: null,
+};
+
+let dropCounter = 0;
+let dropInterval = 800;
+let lastTime = 0;
+let running = false;
+let onlineMode = false;
+let room = null;
+
+const colors = [
+  null,
+  '#00ffff',
+  '#0000ff',
+  '#ff7f00',
+  '#ffff00',
+  '#00ff00',
+  '#800080',
+  '#ff0000',
+];
+
+function createMatrix(w,h){
+  const m = [];
+  while(h--) m.push(new Array(w).fill(0));
+  return m;
+}
+
+function collide(arena, player){
+  const [m, o] = [player.matrix, player.pos];
+  for (let y=0;y<m.length;y++){
+    for (let x=0;x<m[y].length;x++){
+      if (m[y][x] !== 0 &&
+         (arena[y+o.y] && arena[y+o.y][x+o.x]) !== 0){
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function merge(arena, player){
+  player.matrix.forEach((row,y)=>{
+    row.forEach((val,x)=>{
+      if (val !== 0) arena[y+player.pos.y][x+player.pos.x] = val;
+    });
+  });
+}
+
+function rotate(matrix, dir){
+  for (let y=0;y<matrix.length;y++){
+    for (let x=0;x<y;x++){
+      [matrix[x][y], matrix[y][x]] = [matrix[y][x], matrix[x][y]];
+    }
+  }
+  if (dir > 0) matrix.forEach(row => row.reverse());
+  else matrix.reverse();
+}
+
+function playerDrop(){
+  player.pos.y++;
+  if (collide(arena, player)){
+    player.pos.y--;
+    merge(arena, player);
+    sweep();
+    playerReset();
+    if (collide(arena, player)){
+      // Game over
+      running = false;
+      if (onlineMode && socket) socket.emit('gameOver', { score: player.score });
+      setTimeout(()=>alert('Game Over! Final score: ' + player.score), 10);
+    }
+  }
+  dropCounter = 0;
+}
+
+function playerMove(dir){
+  player.pos.x += dir;
+  if (collide(arena, player)) player.pos.x -= dir;
+}
+
+function playerRotate(dir){
+  const pos = player.pos.x;
+  rotate(player.matrix, dir);
+  let offset = 1;
+  while (collide(arena, player)){
+    player.pos.x += offset;
+    offset = -(offset + (offset > 0 ? 1 : -1));
+    if (offset > player.matrix[0].length) {
+      rotate(player.matrix, -dir);
+      player.pos.x = pos;
+      return;
+    }
+  }
+}
+
+function sweep(){
+  let rowCount = 0;
+  outer: for (let y = arena.length -1; y > 0; --y){
+    for (let x=0;x<arena[y].length;x++){
+      if (arena[y][x] === 0) continue outer;
+    }
+    const row = arena.splice(y,1)[0].fill(0);
+    arena.unshift(row);
+    ++y;
+    rowCount++;
+  }
+  if (rowCount > 0){
+    const points = [0,40,100,300,1200];
+    player.score += points[rowCount] || rowCount * 100;
+    scoreEl.textContent = 'Score: ' + player.score;
+    if (onlineMode && socket) {
+      socket.emit('scoreUpdate', { score: player.score });
+    }
+  }
+}
+
+function playerReset(){
+  const pieces = 'TJLOSZI';
+  player.matrix = createPiece(pieces[ Math.floor(Math.random()*pieces.length) ]);
+  player.pos.y = 0;
+  player.pos.x = Math.floor(COLS / 2) - Math.floor(player.matrix[0].length / 2);
+}
+
+function createPiece(type){
+  switch (type){
+    case 'T': return [
+      [0,1,0],
+      [1,1,1],
+      [0,0,0],
+    ];
+    case 'O': return [
+      [2,2],
+      [2,2],
+    ];
+    case 'L': return [
+      [0,0,3],
+      [3,3,3],
+      [0,0,0],
+    ];
+    case 'J': return [
+      [4,0,0],
+      [4,4,4],
+      [0,0,0],
+    ];
+    case 'I': return [
+      [0,5,0,0],
+      [0,5,0,0],
+      [0,5,0,0],
+      [0,5,0,0],
+    ];
+    case 'S': return [
+      [0,6,6],
+      [6,6,0],
+      [0,0,0],
+    ];
+    case 'Z': return [
+      [7,7,0],
+      [0,7,7],
+      [0,0,0],
+    ];
+  }
+}
+
+function draw(){
+  ctx.fillStyle = '#081018';
+  ctx.fillRect(0,0,canvas.width, canvas.height);
+
+  drawMatrix(arena, {x:0,y:0});
+  drawMatrix(player.matrix, player.pos);
+}
+
+function drawMatrix(matrix, offset){
+  matrix.forEach((row,y)=>{
+    row.forEach((val,x)=>{
+      if (val !== 0){
+        ctx.fillStyle = colors[val];
+        ctx.fillRect((x + offset.x) * scale, (y + offset.y) * scale, scale-1, scale-1);
+      }
+    });
+  });
+}
+
+function update(time = 0){
+  if (!running) return;
+  const deltaTime = time - lastTime;
+  lastTime = time;
+  dropCounter += deltaTime;
+  if (dropCounter > dropInterval){
+    playerDrop();
+  }
+  draw();
+  requestAnimationFrame(update);
+}
+
+// Input
+document.addEventListener('keydown', ev => {
+  if (!running) return;
+  if (ev.key === 'ArrowLeft') playerMove(-1);
+  else if (ev.key === 'ArrowRight') playerMove(1);
+  else if (ev.key === 'ArrowDown') playerDrop();
+  else if (ev.key === 'ArrowUp') playerRotate(1);
+});
+
+document.getElementById('leftBtn').addEventListener('touchstart', ()=>playerMove(-1));
+document.getElementById('rightBtn').addEventListener('touchstart', ()=>playerMove(1));
+document.getElementById('dropBtn').addEventListener('touchstart', ()=>playerDrop());
+document.getElementById('rotateBtn').addEventListener('touchstart', ()=>playerRotate(1));
+
+// Buttons
+btnSingle.addEventListener('click', () => {
+  onlineMode = false;
+  startGame();
+  roomUI.classList.add('hidden');
+  roomWarning.classList.add('hidden');
+});
+btnOnline.addEventListener('click', () => {
+  onlineMode = true;
+  roomUI.classList.remove('hidden');
+  // show a warning if there's no socket.io server available on same origin (we attempt connect later)
+  roomWarning.textContent = 'Online requires a running socket.io server at the same origin (or use a public server).';
+  roomWarning.classList.remove('hidden');
+});
+
+joinRoomBtn.addEventListener('click', () => {
+  // Try to connect to same origin socket server
+  if (!socket) {
+    const s = connectSocket();
+    if (!s) {
+      alert('No socket.io client available or connection failed. Online features require a socket.io server. You can still play single-player.');
+      return;
+    }
+    setupSocketHandlers(s);
+  }
+  room = roomNameInput.value.trim() || 'default';
+  const name = playerNameInput.value.trim() || 'Player';
+  socket.emit('joinRoom', { room, name });
+  socket.emit('getLeaderboard');
+  startGame();
+});
+
+leaveRoomBtn.addEventListener('click', () => {
+  // simple reload to clear state
+  window.location.reload();
+});
+
+btnLeaderboard.addEventListener('click', () => {
+  if (!socket) {
+    // Attempt to connect and get leaderboard; if server isn't present this will fail
+    const s = connectSocket();
+    if (!s) {
+      alert('No socket server available to fetch leaderboard. Run the server to use leaderboard or play single-player locally.');
+      return;
+    }
+    setupSocketHandlers(s);
+  }
+  socket.emit('getLeaderboard');
+  leaderboardModal.classList.remove('hidden');
+});
+closeLeaderboard.addEventListener('click', ()=>leaderboardModal.classList.add('hidden'));
+
+// Socket event wiring helper
+function setupSocketHandlers(s) {
+  if (!s) return;
+  socket = s;
+  socket.on('opponentScore', (data) => {
+    opponentEl.textContent = `Opponent (${data.name}): ${data.score}`;
+  });
+  socket.on('leaderboardUpdate', (list) => {
+    leaderboardList.innerHTML = '';
+    list.slice(0,20).forEach(item => {
+      const li = document.createElement('li');
+      li.textContent = `${item.name} — ${item.score}`;
+      leaderboardList.appendChild(li);
+    });
+  });
+  socket.on('playerLeft', (info) => {
+    opponentEl.textContent = 'Opponent: —';
+  });
+  socket.on('connect_error', (err) => {
+    console.warn('socket connect_error', err);
+  });
+  socket.on('disconnect', () => {
+    console.log('socket disconnected');
+  });
+}
+
+// Game startup
+function startGame(){
+  arena = createMatrix(COLS, ROWS);
+  player.score = 0;
+  scoreEl.textContent = 'Score: 0';
+  playerReset();
+  running = true;
+  lastTime = 0;
+  update();
+  if (onlineMode && socket){
+    const name = playerNameInput.value.trim() || 'Player';
+    socket.emit('joinRoom', { room: room || 'default', name });
+  }
+}
+
+// When window unmounts, send final score if playing online
+window.addEventListener('beforeunload', () => {
+  if (running && onlineMode && socket) socket.emit('gameOver', { score: player.score });
+});
+
+// Initialize small hint: if socket.io library missing, we still allow single-player
+if (typeof io === 'undefined') {
+  console.info('socket.io client library not loaded; online features disabled.');
+  // hide leaderboard button? Keep it but warn on use.
+}
+  </script>
+</body>
+</html>
